@@ -78,6 +78,12 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(app.decode_upload(f"data:text/plain;base64,{encoded}"), raw)
 
+    def test_health_check(self):
+        response = app.server.test_client().get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok"})
+
     def test_upload_callback_combines_multiple_files(self):
         txt = "Name,Latitude,Longitude\nWP1,12.3,45.6\n"
         rtz = """<route routeName="Route A">

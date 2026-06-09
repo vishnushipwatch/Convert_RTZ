@@ -410,6 +410,11 @@ app = dash.Dash(
 server = app.server  # for gunicorn
 
 
+@server.route("/health")
+def health_check():
+    return {"status": "ok"}, 200
+
+
 # ---------------------------------------------------------------------------
 # Layout components
 # ---------------------------------------------------------------------------
