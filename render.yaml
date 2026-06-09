@@ -6,7 +6,7 @@ services:
     name: convert-rtz
     runtime: python
     plan: free
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: python -c "import sys; assert sys.version_info[:2] == (3, 11), f'Expected Python 3.11, got {sys.version}'" && python -m pip install --upgrade pip && python -m pip install -r requirements.txt
     startCommand: gunicorn app:server -b 0.0.0.0:$PORT --workers 2 --timeout 120
     healthCheckPath: /health
     envVars:
