@@ -1,6 +1,6 @@
 """
-RTZ / RT3 / RTM / TXT to CSV Converter
-A Dash application that converts maritime route files (RTZ, RT3, RTM) and TXT files to CSV.
+RTZ to Multiple Formats Converter
+A Dash application that converts maritime RTZ route files to CSV, TXT, RT3, and RTM formats.
 """
 
 import base64
@@ -156,194 +156,287 @@ def parse_rtz(content):
     return _drop_empty_columns(pd.DataFrame(rows))
 
 
-def parse_rt3(content):
+# ---------------------------------------------------------------------------
+# Format generators
+# ---------------------------------------------------------------------------
+
+def _decimal_to_dms(decimal, is_lat):
+    """Convert decimal degrees to degrees, minutes, and hemisphere string."""
+    if decimal is None:
+        return ""
+    hemisphere = "N" if decimal >= 0 else "S" if is_lat else "E" if decimal >= 0 else "W"
+    abs_val = abs(decimal)
+    degrees = int(abs_val)
+    minutes = (abs_val - degrees) * 60
+    return f"{degrees:02d} {minutes:06.3f} {hemisphere}"
+
+
+def _decimal_to_dms_components(decimal, is_lat):
+    """Convert decimal degrees to (degrees, minutes, hemisphere) tuple for CSV output."""
+    if decimal is None:
+        return ("", "", "")
+    hemisphere = "N" if decimal >= 0 else "S" if is_lat else "E" if decimal >= 0 else "W"
+    abs_val = abs(decimal)
+    degrees = int(abs_val)
+    minutes = (abs_val - degrees) * 60
+    return (f"{degrees:02d}", f"{minutes:06.3f}", hemisphere)
+
+
+def generate_csv(df):
     """
-    Parse an RT3 (XML) report file and return a DataFrame of report rows.
-    RT3 contains a 'report' root with an embedded RTZ <route> element.
-    We extract the embedded RTZ route; if not present, we fall back to
-    returning report-level metadata.
+    Generate CSV content from the DataFrame in JRC ECDIS Route Sheet format.
+    Produces comment header lines and comma-separated data rows with DMS coordinates.
     """
-    try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
-        return _parse_rt3_text(content)
+    if df.empty:
+        return ""
 
-    # If the file already has a <route> at top-level, parse it as RTZ
-    if _local(root.tag) == "route":
-        return parse_rtz(content)
+    route_name = df["RouteName"].iloc[0] if "RouteName" in df.columns else "Converted Route"
+    # Derive a short code from route name (first 3 chars + first 3 chars after hyphen, uppercase)
+    short_code = "".join(
+        p[:3].upper() for p in route_name.replace("-", " ").split() if p.strip()
+    )[:12]
 
-    route_elems = [el for el in root.iter() if _local(el.tag) == "route"]
-    if route_elems:
-        tmp_root = ET.Element("routes")
-        for r in route_elems:
-            tmp_root.append(r)
-        return parse_rtz(ET.tostring(tmp_root, encoding="unicode"))
+    output = io.StringIO()
 
-    return _parse_rt3_metadata(root)
+    # Write header lines manually (avoid csv.writer quoting the route line with commas)
+    output.write("// ROUTE SHEET exported by JRC ECDIS.\n")
+    output.write("// <<NOTE>>This strings // indicate comment column/cells. You can edit freely.\n")
+    output.write(f"// {route_name},<Normal>,{short_code}\n")
+    output.write("// WPT No.,LAT,,,LON,,,PORT[NM],STBD[NM],Arr. Rad[NM],Speed[kn],Sail(RL/GC),ROT[deg/min],Turn Rad[NM],Time Zone,,Name\n")
+
+    writer = csv.writer(output, lineterminator="\n")
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
+
+        if pd.notna(lat) and lat is not None:
+            lat_deg, lat_min, lat_hemi = _decimal_to_dms_components(lat, is_lat=True)
+        else:
+            lat_deg, lat_min, lat_hemi = "", "", ""
+
+        if pd.notna(lon) and lon is not None:
+            lon_deg, lon_min, lon_hemi = _decimal_to_dms_components(lon, is_lat=False)
+        else:
+            lon_deg, lon_min, lon_hemi = "", "", ""
+
+        # Fetch fields with defaults
+        port_xtd = row.get("PortsideXTD")
+        stbd_xtd = row.get("StarboardXTD")
+        radius = row.get("Radius")
+        speed = row.get("SpeedMax")
+        leg_geom = row.get("LegGeometryType")
+        turn_radius = row.get("TurnRadius")
+        wp_name = row.get("Name") or row.get("WaypointId") or ""
+
+        # Helper: format value or "***" for missing
+        def _val(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return "***"
+            if isinstance(v, float):
+                return f"{v:.2f}".rstrip("0").rstrip(".") if "." in f"{v:.2f}" else f"{v:.2f}"
+            s = str(v).strip()
+            return s if s else "***"
+
+        # Compute ROT if both speed and turn radius are available
+        speed_f = _to_float(speed)
+        turn_rad_f = _to_float(turn_radius)
+        if speed_f is not None and turn_rad_f is not None and turn_rad_f > 0 and _to_float(speed) and pd.notna(speed):
+            # ROT (deg/min) = speed / turn_radius * 180 / (π * 60)
+            rot = speed_f / turn_rad_f * 180 / (3.141592653589793 * 60)
+            rot_str = f"{rot:.2f}"
+        else:
+            rot_str = "***"
+
+        # For the first (start) waypoint, use *** for navigation fields like the sample
+        is_first = (idx == 0)
+
+        row_out = [
+            f"{idx:03d}",
+            lat_deg, lat_min, lat_hemi,
+            lon_deg, lon_min, lon_hemi,
+            "***" if is_first else _val(port_xtd),
+            "***" if is_first else _val(stbd_xtd),
+            "***" if is_first else _val(radius),
+            "***" if is_first else _val(speed),
+            "***" if is_first else _val(leg_geom),
+            "***" if is_first else rot_str,
+            "***" if is_first else _val(turn_radius),
+            "00:00",
+            "E",
+            str(wp_name) if wp_name else "",
+        ]
+        writer.writerow(row_out)
+
+    return output.getvalue()
 
 
-def parse_rtm(content):
-    """
-    Parse a binary RTM route file.
-    The observed RTM route samples use a fixed-width waypoint table:
-    count at byte 32, waypoint name at record+0, and lat/lon doubles at record+130.
-    """
-    data = content if isinstance(content, bytes) else str(content).encode("latin-1", errors="ignore")
-    if not data.startswith(b"Route File Version") or len(data) < 396:
-        raise ValueError("Unsupported RTM binary route layout")
+def generate_txt(df):
+    """Generate TXT (tab-separated) content from the DataFrame."""
+    if df.empty:
+        return ""
 
-    route_name = _first_printable_text(data[36:164], "RTM route")
-    waypoint_count = struct.unpack_from("<I", data, 32)[0]
-    record_start = 250
+    lines = []
+    # Header
+    header_cols = ["NAME", "LAT", "LON", "LEG_TYPE", "TURN_RADIUS",
+                   "CHN_LIMIT", "PLANNED_SPEED", "SPEED_MIN", "SPEED_MAX",
+                   "COURSE", "LENGTH", "DO_PLAN", "HFO_PLAN", "HFO_LEFT",
+                   "DO_LEFT", "ETA_DAY", "ETA_TIME"]
+    lines.append("\t".join(header_cols))
+
+    for _, row in df.iterrows():
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
+        lat_str = _decimal_to_dms(lat, is_lat=True) if pd.notna(lat) else ""
+        lon_str = _decimal_to_dms(lon, is_lat=False) if pd.notna(lon) else ""
+
+        vals = [
+            str(row.get("Name", "") or ""),
+            lat_str,
+            lon_str,
+            str(row.get("LegGeometryType", "") or ""),
+            str(row.get("TurnRadius", "") or ""),
+            "",
+            str(row.get("SpeedMax", "") or ""),
+            str(row.get("SpeedMin", "") or ""),
+            str(row.get("SpeedMax", "") or ""),
+            str(row.get("Course", "") or ""),
+            str(row.get("LegDistance", "") or ""),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+        lines.append("\t".join(vals))
+
+    return "\n".join(lines)
+
+
+def generate_rt3(df):
+    """Generate RT3 (XML voyage report with embedded route) content from the DataFrame."""
+    root = ET.Element("report")
+
+    voyage = ET.SubElement(root, "voyage")
+    ET.SubElement(voyage, "id").text = "CONVERTED"
+
+    route = ET.SubElement(root, "route")
+    route.set("version", "1.0")
+
+    route_info = ET.SubElement(route, "routeInfo")
+    route_name = df["RouteName"].iloc[0] if "RouteName" in df.columns and not df.empty else "Converted Route"
+    route_info.set("routeName", route_name)
+
+    waypoints = ET.SubElement(route, "waypoints")
+    for _, row in df.iterrows():
+        wp = ET.SubElement(waypoints, "waypoint")
+        wp_id = str(row.get("WaypointId", "")) if pd.notna(row.get("WaypointId")) else ""
+        wp_name = str(row.get("Name", "")) if pd.notna(row.get("Name")) else ""
+        if wp_id:
+            wp.set("id", wp_id)
+        if wp_name:
+            wp.set("name", wp_name)
+
+        position = ET.SubElement(wp, "position")
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
+        if pd.notna(lat):
+            position.set("lat", str(lat))
+        if pd.notna(lon):
+            position.set("lon", str(lon))
+
+        turn_radius = row.get("TurnRadius")
+        if pd.notna(turn_radius):
+            wp.set("turnRadius", str(turn_radius))
+
+        speed_max = row.get("SpeedMax")
+        if pd.notna(speed_max):
+            wp.set("speedMax", str(speed_max))
+
+        speed_min = row.get("SpeedMin")
+        if pd.notna(speed_min):
+            wp.set("speedMin", str(speed_min))
+
+        course = row.get("Course")
+        if pd.notna(course):
+            wp.set("course", str(course))
+
+        leg_distance = row.get("LegDistance")
+        if pd.notna(leg_distance):
+            wp.set("legDistance", str(leg_distance))
+
+        leg = ET.SubElement(wp, "leg")
+        leg_geom = row.get("LegGeometryType")
+        if pd.notna(leg_geom) and str(leg_geom).strip():
+            leg.set("geometryType", str(leg_geom))
+
+        starboard_xtd = row.get("StarboardXTD")
+        if pd.notna(starboard_xtd):
+            leg.set("starboardXTD", str(starboard_xtd))
+
+        portside_xtd = row.get("PortsideXTD")
+        if pd.notna(portside_xtd):
+            leg.set("portsideXTD", str(portside_xtd))
+
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+def generate_rtm(df):
+    """Generate binary RTM content from the DataFrame."""
+    if df.empty:
+        return b""
+
+    route_name = df["RouteName"].iloc[0] if "RouteName" in df.columns else "RTZ Route"
+    waypoint_count = len(df)
+
+    # Build the binary structure
+    buf = io.BytesIO()
+
+    # Header: "Route File Version" + padding
+    buf.write(b"Route File Version 1.00")
+    buf.write(b"\x00" * (32 - buf.tell()))
+
+    # Waypoint count at byte 32
+    buf.write(struct.pack("<I", waypoint_count))
+
+    # Route name at byte 36
+    name_bytes = route_name.encode("utf-8", errors="replace")[:128]
+    buf.write(name_bytes)
+    buf.write(b"\x00" * (164 - buf.tell()))
+
+    # Padding up to record start (byte 250)
+    buf.write(b"\x00" * (250 - buf.tell()))
+
     record_size = 304
     position_offset = 130
 
-    rows = []
-    for wp_index in range(waypoint_count):
-        base = record_start + wp_index * record_size
-        lat_offset = base + position_offset
-        lon_offset = lat_offset + 8
-        if lon_offset + 8 > len(data):
-            break
+    for _, row in df.iterrows():
+        base = buf.tell()
 
-        latitude = struct.unpack_from("<d", data, lat_offset)[0]
-        longitude = struct.unpack_from("<d", data, lon_offset)[0]
-        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-            continue
+        # Waypoint name at record+0
+        wp_name = str(row.get("Name", "")) if pd.notna(row.get("Name")) else ""
+        name_bytes = wp_name.encode("utf-8", errors="replace")[:128]
+        buf.write(name_bytes)
+        buf.write(b"\x00" * (128 - len(name_bytes)))
 
-        rows.append({
-            "RouteIndex": 1,
-            "RouteName": route_name,
-            "WaypointId": str(wp_index),
-            "Name": _clean_binary_text(data[base:base + 128]),
-            "Latitude": latitude,
-            "Longitude": longitude,
-        })
+        # Padding up to position offset
+        buf.write(b"\x00" * (position_offset - (buf.tell() - base)))
 
-    return _drop_empty_columns(pd.DataFrame(rows))
+        # Latitude at record+130
+        lat = float(row.get("Latitude", 0)) if pd.notna(row.get("Latitude")) else 0.0
+        buf.write(struct.pack("<d", lat))
 
+        # Longitude at record+138
+        lon = float(row.get("Longitude", 0)) if pd.notna(row.get("Longitude")) else 0.0
+        buf.write(struct.pack("<d", lon))
 
-def _parse_rt3_metadata(root):
-    rows = []
-    for el in root.iter():
-        local = _local(el.tag)
-        if local in ("report", "voyage", "vessel", "reportHeader", "position", "routeInfo"):
-            for child in el:
-                rows.append({
-                    "Section": local,
-                    "Field": _local(child.tag),
-                    "Value": _text(child),
-                })
-    if not rows:
-        rows.append({"Section": "report", "Field": "raw",
-                     "Value": ET.tostring(root, encoding="unicode")})
-    return _drop_empty_columns(pd.DataFrame(rows))
+        # Padding to fill the record
+        remaining = record_size - (buf.tell() - base)
+        if remaining > 0:
+            buf.write(b"\x00" * remaining)
 
-
-def _parse_rt3_text(content):
-    """Best-effort fallback for malformed RT3: split lines into key:value pairs."""
-    rows = []
-    for i, line in enumerate(content.splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        if ":" in line:
-            key, _, value = line.partition(":")
-            rows.append({"Line": i, "Field": key.strip(), "Value": value.strip()})
-        else:
-            rows.append({"Line": i, "Field": "text", "Value": line})
-    return pd.DataFrame(rows)
-
-
-TXT_ROUTE_COLUMNS = {
-    "NAME": "Name",
-    "LAT": "LatitudeText",
-    "LON": "LongitudeText",
-    "LEG_TYPE": "LegType",
-    "TURN_RADIUS": "TurnRadius",
-    "CHN_LIMIT": "ChannelLimit",
-    "PLANNED_SPEED": "PlannedSpeed",
-    "SPEED_MIN": "SpeedMin",
-    "SPEED_MAX": "SpeedMax",
-    "COURSE": "Course",
-    "LENGTH": "LegDistance",
-    "DO_PLAN": "DOPlan",
-    "HFO_PLAN": "HFOPlan",
-    "HFO_LEFT": "HFOLeft",
-    "DO_LEFT": "DOLeft",
-    "ETA_DAY": "ETADay",
-    "ETA_TIME": "ETATime",
-}
-
-
-def _split_tab_route_line(line):
-    return [part.strip() for part in line.split("\t") if part != ""]
-
-
-def _parse_txt_route_table(content):
-    """Parse route-table TXT files with metadata blocks followed by NAME/LAT/LON rows."""
-    lines = content.splitlines()
-    header_index = None
-    headers = []
-    for i, line in enumerate(lines):
-        parts = _split_tab_route_line(line)
-        if len(parts) >= 3 and parts[0].upper() == "NAME" and parts[1].upper() == "LAT" and parts[2].upper() == "LON":
-            header_index = i
-            headers = parts
-            break
-
-    if header_index is None:
-        return None
-
-    rows = []
-    normalized_headers = [TXT_ROUTE_COLUMNS.get(header.upper(), header.title().replace("_", "")) for header in headers]
-    for route_index, line in enumerate(lines[header_index + 1:], start=1):
-        parts = _split_tab_route_line(line)
-        if not parts:
-            continue
-        if len(parts) < len(headers):
-            parts.extend([""] * (len(headers) - len(parts)))
-        row = dict(zip(normalized_headers, parts[:len(headers)]))
-        row["WaypointId"] = route_index
-        row["Latitude"] = _coordinate_to_decimal(row.get("LatitudeText"))
-        row["Longitude"] = _coordinate_to_decimal(row.get("LongitudeText"))
-        for field in (
-            "TurnRadius", "ChannelLimit", "PlannedSpeed", "SpeedMin", "SpeedMax",
-            "Course", "LegDistance", "DOPlan", "HFOPlan", "HFOLeft", "DOLeft",
-        ):
-            if field in row:
-                row[field] = _to_float(row[field], row[field])
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def parse_txt(content):
-    """
-    Parse a TXT route/waypoint file.
-    Supports comma-, tab-, semicolon- and whitespace-separated columns.
-    Lines starting with '#' are treated as comments.
-    """
-    route_df = _parse_txt_route_table(content)
-    if route_df is not None:
-        return route_df
-
-    sample = "\n".join(content.splitlines()[:20])
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        delimiter = dialect.delimiter
-    except Exception:
-        delimiter = None
-
-    if delimiter is None:
-        try:
-            return pd.read_csv(io.StringIO(content), sep=r"\s+", comment="#", engine="python")
-        except Exception:
-            return pd.DataFrame({"raw": content.splitlines()})
-    try:
-        return pd.read_csv(io.StringIO(content), sep=delimiter, comment="#")
-    except Exception:
-        return pd.DataFrame({"raw": content.splitlines()})
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -355,18 +448,10 @@ def convert_to_dataframe(filename, content):
     name = (filename or "").lower()
     if name.endswith(".rtz"):
         return parse_rtz(content)
-    if name.endswith(".rt3"):
-        return parse_rt3(content)
-    if name.endswith(".rtm"):
-        return parse_rtm(content)
-    if name.endswith(".txt"):
-        return parse_txt(content)
-    # Unknown extension: best effort
-    if isinstance(content, bytes):
-        return parse_rtm(content)
-    if content.lstrip().startswith("<"):
-        return parse_rt3(content)
-    return parse_txt(content)
+    # Unknown extension: best effort XML parse
+    if isinstance(content, str) and content.lstrip().startswith("<"):
+        return parse_rtz(content)
+    raise ValueError(f"Unsupported file format: {filename}. Only RTZ files are supported.")
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +487,7 @@ external_stylesheets = [
 app = dash.Dash(
     __name__,
     external_stylesheets=external_stylesheets,
-    title="RTZ / RT3 / RTM / TXT → CSV Converter",
+    title="RTZ → Multiple Formats Converter",
     suppress_callback_exceptions=True,
     update_title=None,
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
@@ -428,7 +513,7 @@ NAVBAR = dbc.Navbar(
                         dbc.Col(html.I(className="bi bi-compass",
                                        style={"fontSize": "1.8rem", "color": "#ffffff"})),
                         dbc.Col(
-                            dbc.NavbarBrand("RTZ / RT3 / RTM / TXT → CSV Converter",
+                            dbc.NavbarBrand("RTZ → Multiple Formats Converter",
                                             className="ms-2",
                                             style={"fontWeight": "600", "color": "white"}),
                         ),
@@ -456,9 +541,9 @@ UPLOAD_CARD = dbc.Card(
                 [
                     html.I(className="bi bi-cloud-arrow-up-fill",
                            style={"fontSize": "2.5rem", "color": "#2C3E50"}),
-                    html.H4("Drop your file here", className="mt-3 mb-1",
+                    html.H4("Drop your RTZ file here", className="mt-3 mb-1",
                             style={"fontWeight": "600"}),
-                    html.P("or click to browse — supports .rtz, .rt3, .rtm and .txt files",
+                    html.P("or click to browse — supports .rtz files only",
                            className="text-muted mb-3"),
                 ],
                 className="text-center",
@@ -485,8 +570,8 @@ UPLOAD_CARD = dbc.Card(
                     "backgroundColor": "#F8F9FA",
                     "cursor": "pointer",
                 },
-                multiple=True,
-                accept=".rtz,.rt3,.rtm,.txt",
+                multiple=False,
+                accept=".rtz",
             ),
             html.Div(id="upload-status", className="mt-3"),
         ]
@@ -521,17 +606,64 @@ DOWNLOAD_CARD = dbc.Card(
         [
             html.H5([html.I(className="bi bi-download me-2"), "Export"],
                     style={"fontWeight": "600"}),
-            html.P("Download the converted data as a CSV file.",
+            html.P("Download the converted data in your preferred format.",
                    className="text-muted"),
-            dbc.Button(
-                [html.I(className="bi bi-download me-2"), "Download CSV"],
-                id="download-btn",
-                color="success",
-                className="w-100",
-                disabled=True,
-                size="lg",
+            dbc.Row(
+                [
+                    dbc.Col(
+                        dbc.Button(
+                            [html.I(className="bi bi-filetype-csv me-2"), "CSV"],
+                            id="download-csv-btn",
+                            color="success",
+                            className="w-100",
+                            disabled=True,
+                            size="lg",
+                        ),
+                        className="mb-2",
+                    ),
+                    dbc.Col(
+                        dbc.Button(
+                            [html.I(className="bi bi-filetype-txt me-2"), "TXT"],
+                            id="download-txt-btn",
+                            color="primary",
+                            className="w-100",
+                            disabled=True,
+                            size="lg",
+                        ),
+                        className="mb-2",
+                    ),
+                ],
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        dbc.Button(
+                            [html.I(className="bi bi-filetype-xml me-2"), "RT3"],
+                            id="download-rt3-btn",
+                            color="warning",
+                            className="w-100",
+                            disabled=True,
+                            size="lg",
+                        ),
+                        className="mb-2",
+                    ),
+                    dbc.Col(
+                        dbc.Button(
+                            [html.I(className="bi bi-file-binary me-2"), "RTM"],
+                            id="download-rtm-btn",
+                            color="info",
+                            className="w-100",
+                            disabled=True,
+                            size="lg",
+                        ),
+                        className="mb-2",
+                    ),
+                ],
             ),
             dcc.Download(id="download-csv"),
+            dcc.Download(id="download-txt"),
+            dcc.Download(id="download-rt3"),
+            dcc.Download(id="download-rtm"),
         ]
     ),
     id="download-card",
@@ -546,19 +678,21 @@ ABOUT_CARD = dbc.Card(
             html.H5([html.I(className="bi bi-info-circle me-2"), "About"],
                     style={"fontWeight": "600"}),
             html.P(
-                "This tool converts maritime route files in RTZ (Route Exchange Format), RT3 "
-                "(voyage reports), RTM and plain TXT files into clean CSV spreadsheets.",
+                "This tool converts maritime RTZ (Route Exchange Format) files into "
+                "multiple output formats including CSV, TXT, RT3, and RTM.",
                 className="text-muted",
             ),
             html.Hr(),
-            html.P([html.Strong("RTZ: "), "Standardised XML route format with named waypoints, "
-                                            "coordinates and turn radii."], className="mb-2"),
-            html.P([html.Strong("RT3: "), "Voyage report format containing an embedded route plus "
-                                            "voyage metadata."], className="mb-2"),
-            html.P([html.Strong("RTM: "), "Binary route files with fixed-width waypoint records."],
+            html.P([html.Strong("RTZ (Input): "), "Standardised XML route format with named waypoints, "
+                                                    "coordinates and turn radii."], className="mb-2"),
+            html.P([html.Strong("CSV: "), "Comma-separated values for spreadsheets and data analysis."],
                    className="mb-2"),
-            html.P([html.Strong("TXT: "), "Free-form waypoint lists; the converter auto-detects the "
-                                           "delimiter (comma, tab, semicolon or whitespace)."]),
+            html.P([html.Strong("TXT: "), "Tab-separated waypoint list with DMS coordinates."],
+                   className="mb-2"),
+            html.P([html.Strong("RT3: "), "XML voyage report format with embedded route data."],
+                   className="mb-2"),
+            html.P([html.Strong("RTM: "), "Binary route file format compatible with legacy systems."],
+                   className="mb-2"),
             html.Hr(),
             html.P([html.Strong("Tips: "), "Files are processed in memory for the current request "
                                             "and are not stored."],
@@ -605,7 +739,10 @@ app.layout = dbc.Container(
     Output("upload-status", "children"),
     Output("preview-card", "style"),
     Output("download-card", "style"),
-    Output("download-btn", "disabled"),
+    Output("download-csv-btn", "disabled"),
+    Output("download-txt-btn", "disabled"),
+    Output("download-rt3-btn", "disabled"),
+    Output("download-rtm-btn", "disabled"),
     Output("preview-title", "children"),
     Output("row-count-badge", "children"),
     Output("preview-table", "children"),
@@ -614,66 +751,37 @@ app.layout = dbc.Container(
 )
 def on_upload(contents, filename):
     if not contents:
-        return (None, "", {"display": "none"}, {"display": "none"}, True,
-                "Data Preview", "", "")
+        return (None, "", {"display": "none"}, {"display": "none"},
+                True, True, True, True, "Data Preview", "", "")
 
-    content_items = contents if isinstance(contents, list) else [contents]
-    filenames = filename if isinstance(filename, list) else [filename]
-
-    frames = []
-    failures = []
     try:
-        for item, name in zip(content_items, filenames):
-            is_binary_route = (name or "").lower().endswith(".rtm")
-            text = decode_upload(item, as_bytes=is_binary_route)
-            try:
-                parsed = convert_to_dataframe(name, text)
-            except Exception as exc:
-                failures.append(f"{name or 'file'}: {exc}")
-                continue
-            if parsed is None or parsed.empty:
-                failures.append(f"{name or 'file'}: no tabular data found")
-                continue
-            parsed.insert(0, "SourceFile", name or "uploaded-file")
-            frames.append(parsed)
+        text = decode_upload(contents)
+        parsed = convert_to_dataframe(filename, text)
     except Exception as exc:
-        msg = dbc.Alert(f"Failed to read upload: {exc}", color="danger", className="mt-3")
-        return (None, msg, {"display": "none"}, {"display": "none"}, True,
-                "Data Preview", "", "")
+        msg = dbc.Alert(f"Failed to parse file: {exc}", color="danger", className="mt-3")
+        return (None, msg, {"display": "none"}, {"display": "none"},
+                True, True, True, True, "Data Preview", "", "")
 
-    if not frames:
+    if parsed is None or parsed.empty:
         msg = dbc.Alert(
-            "No tabular data could be extracted from the uploaded file(s).",
+            "No tabular data could be extracted from the uploaded file.",
             color="warning",
             className="mt-3",
         )
-        return (None, msg, {"display": "none"}, {"display": "none"}, True,
-                "Data Preview", "", "")
+        return (None, msg, {"display": "none"}, {"display": "none"},
+                True, True, True, True, "Data Preview", "", "")
 
-    df = _drop_empty_columns(pd.concat(frames, ignore_index=True, sort=False))
-    loaded_count = len(frames)
-    file_label = ", ".join(name or "file" for name in filenames[:3])
-    if len(filenames) > 3:
-        file_label += f", +{len(filenames) - 3} more"
-    store = {"filenames": filenames, "records": df.to_dict(orient="records")}
-
-    status_children = [
-        html.I(className="bi bi-check-circle-fill me-2"),
-        "Successfully loaded ",
-        html.Strong(file_label),
-        f" — {len(df)} row(s), {len(df.columns)} column(s) from {loaded_count} file(s).",
-    ]
-    if failures:
-        status_children.extend([
-            html.Br(),
-            html.Small("Skipped: " + "; ".join(failures), className="text-muted"),
-        ])
+    df = _drop_empty_columns(parsed)
+    store = {"filename": filename, "records": df.to_dict(orient="records")}
 
     status = dbc.Alert(
         [
-            html.Div(status_children),
+            html.I(className="bi bi-check-circle-fill me-2"),
+            "Successfully loaded ",
+            html.Strong(filename or "file"),
+            f" — {len(df)} row(s), {len(df.columns)} column(s).",
         ],
-        color="warning" if failures else "success",
+        color="success",
         className="mt-3 d-flex align-items-center",
     )
 
@@ -718,30 +826,80 @@ def on_upload(contents, filename):
         status,
         {"display": "block", "border": "none", "borderRadius": "8px"},
         {"display": "block", "border": "none", "borderRadius": "8px"},
-        False,
-        f"Preview — {loaded_count} file(s)",
+        False, False, False, False,
+        f"Preview — {filename or 'file'}",
         f"{len(df)} rows",
         table,
     )
 
 
+def _get_base_filename(store):
+    """Extract the base filename (without extension) from the store."""
+    if not store:
+        return "converted_route"
+    filename = store.get("filename", "route.rtz") or "route.rtz"
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return base
+
+
 @app.callback(
     Output("download-csv", "data"),
-    Input("download-btn", "n_clicks"),
+    Input("download-csv-btn", "n_clicks"),
     State("df-store", "data"),
     prevent_initial_call=True,
 )
-def on_download(n_clicks, store):
+def on_download_csv(n_clicks, store):
     if not store or not store.get("records"):
         return dash.no_update
-
     df = _drop_empty_columns(pd.DataFrame(store["records"]))
-    filenames = store.get("filenames") or []
-    filename = filenames[0] if len(filenames) == 1 else "converted_routes"
-    base = filename.rsplit(".", 1)[0] if "." in filename else filename
-    csv_name = f"{base}.csv"
+    base = _get_base_filename(store)
+    content = generate_csv(df)
+    return dict(content=content, filename=f"{base}.csv")
 
-    return dcc.send_data_frame(df.to_csv, csv_name, index=False)
+
+@app.callback(
+    Output("download-txt", "data"),
+    Input("download-txt-btn", "n_clicks"),
+    State("df-store", "data"),
+    prevent_initial_call=True,
+)
+def on_download_txt(n_clicks, store):
+    if not store or not store.get("records"):
+        return dash.no_update
+    df = _drop_empty_columns(pd.DataFrame(store["records"]))
+    base = _get_base_filename(store)
+    content = generate_txt(df)
+    return dict(content=content, filename=f"{base}.txt")
+
+
+@app.callback(
+    Output("download-rt3", "data"),
+    Input("download-rt3-btn", "n_clicks"),
+    State("df-store", "data"),
+    prevent_initial_call=True,
+)
+def on_download_rt3(n_clicks, store):
+    if not store or not store.get("records"):
+        return dash.no_update
+    df = _drop_empty_columns(pd.DataFrame(store["records"]))
+    base = _get_base_filename(store)
+    content = generate_rt3(df)
+    return dict(content=content, filename=f"{base}.rt3")
+
+
+@app.callback(
+    Output("download-rtm", "data"),
+    Input("download-rtm-btn", "n_clicks"),
+    State("df-store", "data"),
+    prevent_initial_call=True,
+)
+def on_download_rtm(n_clicks, store):
+    if not store or not store.get("records"):
+        return dash.no_update
+    df = _drop_empty_columns(pd.DataFrame(store["records"]))
+    base = _get_base_filename(store)
+    content = generate_rtm(df)
+    return dcc.send_bytes(content, f"{base}.rtm")
 
 
 # ---------------------------------------------------------------------------
