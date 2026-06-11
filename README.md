@@ -1,13 +1,13 @@
-# RTZ / RT3 / RTM / TXT → CSV Converter
+# RT3 / RTM → CSV Converter
 
 A clean, modern Dash web application that converts maritime route files
-(**RTZ**, **RT3**, **RTM**, **TXT**) into downloadable CSV spreadsheets.
+(**RT3**, **RTM**) into downloadable CSV spreadsheets.
 
 ![preview](https://img.shields.io/badge/python-3.11-blue) ![dash](https://img.shields.io/badge/dash-2.17-119DFF) ![deploy](https://img.shields.io/badge/render-free-46E3B7)
 
 ## ✨ Features
 
-- **Drag & drop** upload for `.rtz`, `.rt3`, `.rtm` and `.txt` files
+- **Drag & drop** upload for `.rt3` and `.rtm` files
 - **Smart parsing** — auto-detects route-table TXT, namespaces in XML and fixed-width RTM records
 - **Live preview** of the parsed data in a paginated, searchable table
 - **One-click CSV export**
@@ -18,10 +18,9 @@ A clean, modern Dash web application that converts maritime route files
 
 | Format | Description |
 |--------|-------------|
-| **RTZ** | IALA Route Exchange Format — XML, contains waypoints, vessel and route metadata |
-| **RT3** | Route Exchange Format 3 voyage report — may contain an embedded RTZ route |
-| **RTM** | Binary route files with fixed-width waypoint records |
-| **TXT**  | Free-form waypoint lists (comma-, tab-, semicolon- or whitespace-separated) |
+| **RT3** (Input) | XML voyage report format with embedded route data |
+| **RTM** (Input) | Binary route files with fixed-width waypoint records |
+| **CSV** (Output) | Comma-separated values for spreadsheets and data analysis |
 
 ## 🚀 Local development
 

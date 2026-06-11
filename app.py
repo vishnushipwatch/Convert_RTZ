@@ -1,6 +1,6 @@
 """
-RTZ to Multiple Formats Converter
-A Dash application that converts maritime RTZ route files to CSV, TXT, RT3, and RTM formats.
+RT3 / RTM to CSV Converter
+A Dash application that converts maritime RT3 and RTM route files to CSV format.
 """
 
 import base64
@@ -112,6 +112,44 @@ def _drop_empty_columns(df):
     return df.loc[:, keep]
 
 
+def _parse_waypoints_from_route(route, route_index=1, route_name=""):
+    """Extract waypoints from an RTZ/RT3 <route> element into a list of row dicts."""
+    rows = []
+    route_info = _find_child(route, "routeInfo")
+    resolved_name = (
+        _attr_or_child(route_info, "routeName")
+        or _attr_or_child(route, "routeName")
+        or _child_text(route, "routeName")
+        or route_name
+    )
+
+    waypoint_list = [w for w in route.iter() if _local(w.tag) == "waypoint"]
+
+    for wp_index, wp in enumerate(waypoint_list, start=1):
+        position = _find_child(wp, "position")
+        leg = _find_child(wp, "leg")
+        row = {
+            "RouteIndex": route_index,
+            "RouteName": resolved_name,
+            "WaypointId": wp.attrib.get("id", f"WP{wp_index}"),
+            "Revision": wp.attrib.get("revision", ""),
+            "Name": _attr_or_child(wp, "name"),
+            "Latitude": _to_float(_attr_or_child(position, "lat") or _child_text(wp, "lat")),
+            "Longitude": _to_float(_attr_or_child(position, "lon") or _child_text(wp, "lon")),
+            "Radius": _to_float(_attr_or_child(wp, "radius")),
+            "SpeedMax": _to_float(_attr_or_child(wp, "speedMax")),
+            "SpeedMin": _to_float(_attr_or_child(wp, "speedMin")),
+            "Course": _to_float(_attr_or_child(wp, "course")),
+            "LegDistance": _to_float(_attr_or_child(wp, "legDistance")),
+            "TurnRadius": _to_float(_attr_or_child(wp, "turnRadius")),
+            "LegGeometryType": _attr_or_child(leg, "geometryType"),
+            "StarboardXTD": _to_float(_attr_or_child(leg, "starboardXTD")),
+            "PortsideXTD": _to_float(_attr_or_child(leg, "portsideXTD")),
+        }
+        rows.append(row)
+    return rows
+
+
 def parse_rtz(content):
     """Parse an RTZ (XML) route file and return a DataFrame of waypoints."""
     root = ET.fromstring(content)
@@ -122,37 +160,142 @@ def parse_rtz(content):
         if _local(route.tag) != "route":
             continue
         route_index += 1
-        route_info = _find_child(route, "routeInfo")
-        route_name = (
-            _attr_or_child(route_info, "routeName")
-            or _attr_or_child(route, "routeName")
-            or _child_text(route, "routeName")
-        )
+        route_rows = _parse_waypoints_from_route(route, route_index=route_index)
+        rows.extend(route_rows)
 
-        waypoint_list = [w for w in route.iter() if _local(w.tag) == "waypoint"]
+    return _drop_empty_columns(pd.DataFrame(rows))
 
-        for wp_index, wp in enumerate(waypoint_list, start=1):
-            position = _find_child(wp, "position")
-            leg = _find_child(wp, "leg")
-            row = {
-                "RouteIndex": route_index,
-                "RouteName": route_name,
-                "WaypointId": wp.attrib.get("id", f"WP{wp_index}"),
-                "Revision": wp.attrib.get("revision", ""),
-                "Name": _attr_or_child(wp, "name"),
-                "Latitude": _to_float(_attr_or_child(position, "lat") or _child_text(wp, "lat")),
-                "Longitude": _to_float(_attr_or_child(position, "lon") or _child_text(wp, "lon")),
-                "Radius": _to_float(_attr_or_child(wp, "radius")),
-                "SpeedMax": _to_float(_attr_or_child(wp, "speedMax")),
-                "SpeedMin": _to_float(_attr_or_child(wp, "speedMin")),
-                "Course": _to_float(_attr_or_child(wp, "course")),
-                "LegDistance": _to_float(_attr_or_child(wp, "legDistance")),
-                "TurnRadius": _to_float(_attr_or_child(wp, "turnRadius")),
-                "LegGeometryType": _attr_or_child(leg, "geometryType"),
-                "StarboardXTD": _to_float(_attr_or_child(leg, "starboardXTD")),
-                "PortsideXTD": _to_float(_attr_or_child(leg, "portsideXTD")),
-            }
-            rows.append(row)
+
+# ---------------------------------------------------------------------------
+# RT3 parser
+# ---------------------------------------------------------------------------
+
+def parse_rt3(content):
+    """
+    Parse an RT3 (XML voyage report with embedded route) file and return a DataFrame of waypoints.
+
+    RT3 wraps a <route> inside a <report> element with <voyage> metadata.
+    The internal route structure is identical to RTZ.
+    """
+    root = ET.fromstring(content)
+
+    # If the root itself is a <route>, delegate to parse_rtz
+    if _local(root.tag) == "route":
+        return parse_rtz(content)
+
+    # Otherwise look for a <route> within the document
+    rows = []
+    route_index = 0
+    for route in root.iter():
+        if _local(route.tag) != "route":
+            continue
+        route_index += 1
+        route_rows = _parse_waypoints_from_route(route, route_index=route_index)
+        rows.extend(route_rows)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return _drop_empty_columns(pd.DataFrame(rows))
+
+
+# ---------------------------------------------------------------------------
+# RTM parser (binary format)
+# ---------------------------------------------------------------------------
+
+RTM_HEADER_SIZE = 32
+RTM_WAYPOINT_COUNT_OFFSET = 32
+RTM_ROUTE_NAME_OFFSET = 36
+RTM_ROUTE_NAME_SIZE = 128
+RTM_RECORDS_START = 250
+RTM_RECORD_SIZE = 304
+RTM_NAME_OFFSET = 0
+RTM_NAME_SIZE = 128
+RTM_POSITION_OFFSET = 130
+RTM_LATITUDE_OFFSET = 130
+RTM_LONGITUDE_OFFSET = 138
+
+
+def parse_rtm(content):
+    """
+    Parse a binary RTM route file and return a DataFrame of waypoints.
+
+    Byte layout (derived from generate_rtm):
+        Bytes 0-31:     Header signature "Route File Version 1.00" + null padding
+        Bytes 32-35:    Waypoint count (uint32, little-endian)
+        Bytes 36-163:   Route name (128 bytes, null-terminated UTF-8)
+        Bytes 164-249:  Padding (zeros)
+        Bytes 250+:     304-byte records, one per waypoint:
+            Bytes 0-127:    Waypoint name (128 bytes, null-terminated UTF-8)
+            Bytes 130-137:  Latitude (double, little-endian)
+            Bytes 138-145:  Longitude (double, little-endian)
+    """
+    if isinstance(content, str):
+        raw = content.encode("latin-1")
+    else:
+        raw = content
+
+    if len(raw) < RTM_RECORDS_START:
+        raise ValueError("File too small to be a valid RTM route file")
+
+    # Read header
+    header = raw[:RTM_HEADER_SIZE]
+    header_text = _clean_binary_text(header)
+    if not header_text.startswith("Route File Version"):
+        # Try to be lenient - maybe the header is just shorter
+        pass
+
+    # Read waypoint count
+    if len(raw) < RTM_WAYPOINT_COUNT_OFFSET + 4:
+        raise ValueError("Could not read waypoint count from RTM file")
+    waypoint_count = struct.unpack_from("<I", raw, RTM_WAYPOINT_COUNT_OFFSET)[0]
+
+    # Read route name
+    route_name_raw = raw[RTM_ROUTE_NAME_OFFSET:RTM_ROUTE_NAME_OFFSET + RTM_ROUTE_NAME_SIZE]
+    route_name = _clean_binary_text(route_name_raw)
+
+    # Parse waypoint records
+    rows = []
+    for i in range(waypoint_count):
+        record_offset = RTM_RECORDS_START + i * RTM_RECORD_SIZE
+
+        if record_offset + RTM_RECORD_SIZE > len(raw):
+            # Partial record at end — stop parsing
+            break
+
+        record = raw[record_offset:record_offset + RTM_RECORD_SIZE]
+
+        # Waypoint name
+        name_raw = record[RTM_NAME_OFFSET:RTM_NAME_OFFSET + RTM_NAME_SIZE]
+        wp_name = _clean_binary_text(name_raw)
+
+        # Latitude and longitude (doubles)
+        lat = struct.unpack_from("<d", record, RTM_LATITUDE_OFFSET)[0]
+        lon = struct.unpack_from("<d", record, RTM_LONGITUDE_OFFSET)[0]
+
+        row = {
+            "RouteIndex": 1,
+            "RouteName": route_name,
+            "WaypointId": f"WP{i + 1}",
+            "Revision": "",
+            "Name": wp_name,
+            "Latitude": lat,
+            "Longitude": lon,
+            "Radius": None,
+            "SpeedMax": None,
+            "SpeedMin": None,
+            "Course": None,
+            "LegDistance": None,
+            "TurnRadius": None,
+            "LegGeometryType": "",
+            "StarboardXTD": None,
+            "PortsideXTD": None,
+        }
+        rows.append(row)
+
+    if not rows:
+        raise ValueError("No waypoints found in RTM file")
+
     return _drop_empty_columns(pd.DataFrame(rows))
 
 
@@ -387,7 +530,7 @@ def generate_rtm(df):
     if df.empty:
         return b""
 
-    route_name = df["RouteName"].iloc[0] if "RouteName" in df.columns else "RTZ Route"
+    route_name = df["RouteName"].iloc[0] if "RouteName" in df.columns else "Converted Route"
     waypoint_count = len(df)
 
     # Build the binary structure
@@ -448,10 +591,14 @@ def convert_to_dataframe(filename, content):
     name = (filename or "").lower()
     if name.endswith(".rtz"):
         return parse_rtz(content)
+    if name.endswith(".rt3"):
+        return parse_rt3(content)
+    if name.endswith(".rtm"):
+        return parse_rtm(content)
     # Unknown extension: best effort XML parse
     if isinstance(content, str) and content.lstrip().startswith("<"):
         return parse_rtz(content)
-    raise ValueError(f"Unsupported file format: {filename}. Only RTZ files are supported.")
+    raise ValueError(f"Unsupported file format: {filename}. Supported formats: .rt3, .rtm.")
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +634,7 @@ external_stylesheets = [
 app = dash.Dash(
     __name__,
     external_stylesheets=external_stylesheets,
-    title="RTZ → Multiple Formats Converter",
+    title="RT3 / RTM → CSV Converter",
     suppress_callback_exceptions=True,
     update_title=None,
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
@@ -513,7 +660,7 @@ NAVBAR = dbc.Navbar(
                         dbc.Col(html.I(className="bi bi-compass",
                                        style={"fontSize": "1.8rem", "color": "#ffffff"})),
                         dbc.Col(
-                            dbc.NavbarBrand("RTZ → Multiple Formats Converter",
+                            dbc.NavbarBrand("RT3 / RTM → CSV Converter",
                                             className="ms-2",
                                             style={"fontWeight": "600", "color": "white"}),
                         ),
@@ -541,9 +688,9 @@ UPLOAD_CARD = dbc.Card(
                 [
                     html.I(className="bi bi-cloud-arrow-up-fill",
                            style={"fontSize": "2.5rem", "color": "#2C3E50"}),
-                    html.H4("Drop your RTZ file here", className="mt-3 mb-1",
+                    html.H4("Drop your file here", className="mt-3 mb-1",
                             style={"fontWeight": "600"}),
-                    html.P("or click to browse — supports .rtz files only",
+            html.P("or click to browse — supports .rt3, .rtm files",
                            className="text-muted mb-3"),
                 ],
                 className="text-center",
@@ -571,7 +718,7 @@ UPLOAD_CARD = dbc.Card(
                     "cursor": "pointer",
                 },
                 multiple=False,
-                accept=".rtz",
+                accept=".rt3,.rtm",
             ),
             html.Div(id="upload-status", className="mt-3"),
         ]
@@ -604,66 +751,19 @@ PREVIEW_CARD = dbc.Card(
 DOWNLOAD_CARD = dbc.Card(
     dbc.CardBody(
         [
-            html.H5([html.I(className="bi bi-download me-2"), "Export"],
+            html.H5([html.I(className="bi bi-download me-2"), "Export as CSV"],
                     style={"fontWeight": "600"}),
-            html.P("Download the converted data in your preferred format.",
+            html.P("Download the converted data as a CSV file.",
                    className="text-muted"),
-            dbc.Row(
-                [
-                    dbc.Col(
-                        dbc.Button(
-                            [html.I(className="bi bi-filetype-csv me-2"), "CSV"],
-                            id="download-csv-btn",
-                            color="success",
-                            className="w-100",
-                            disabled=True,
-                            size="lg",
-                        ),
-                        className="mb-2",
-                    ),
-                    dbc.Col(
-                        dbc.Button(
-                            [html.I(className="bi bi-filetype-txt me-2"), "TXT"],
-                            id="download-txt-btn",
-                            color="primary",
-                            className="w-100",
-                            disabled=True,
-                            size="lg",
-                        ),
-                        className="mb-2",
-                    ),
-                ],
-            ),
-            dbc.Row(
-                [
-                    dbc.Col(
-                        dbc.Button(
-                            [html.I(className="bi bi-filetype-xml me-2"), "RT3"],
-                            id="download-rt3-btn",
-                            color="warning",
-                            className="w-100",
-                            disabled=True,
-                            size="lg",
-                        ),
-                        className="mb-2",
-                    ),
-                    dbc.Col(
-                        dbc.Button(
-                            [html.I(className="bi bi-file-binary me-2"), "RTM"],
-                            id="download-rtm-btn",
-                            color="info",
-                            className="w-100",
-                            disabled=True,
-                            size="lg",
-                        ),
-                        className="mb-2",
-                    ),
-                ],
+            dbc.Button(
+                [html.I(className="bi bi-filetype-csv me-2"), "Download CSV"],
+                id="download-csv-btn",
+                color="success",
+                className="w-100",
+                disabled=True,
+                size="lg",
             ),
             dcc.Download(id="download-csv"),
-            dcc.Download(id="download-txt"),
-            dcc.Download(id="download-rt3"),
-            dcc.Download(id="download-rtm"),
         ]
     ),
     id="download-card",
@@ -678,24 +778,20 @@ ABOUT_CARD = dbc.Card(
             html.H5([html.I(className="bi bi-info-circle me-2"), "About"],
                     style={"fontWeight": "600"}),
             html.P(
-                "This tool converts maritime RTZ (Route Exchange Format) files into "
-                "multiple output formats including CSV, TXT, RT3, and RTM.",
+                "This tool converts maritime route files (RT3, RTM) into "
+                "CSV format for use in spreadsheets and data analysis.",
                 className="text-muted",
             ),
             html.Hr(),
-            html.P([html.Strong("RTZ (Input): "), "Standardised XML route format with named waypoints, "
-                                                    "coordinates and turn radii."], className="mb-2"),
-            html.P([html.Strong("CSV: "), "Comma-separated values for spreadsheets and data analysis."],
+            html.P([html.Strong("RT3 (Input): "), "XML voyage report format with embedded route data."],
                    className="mb-2"),
-            html.P([html.Strong("TXT: "), "Tab-separated waypoint list with DMS coordinates."],
+            html.P([html.Strong("RTM (Input): "), "Binary route file format compatible with legacy systems."],
                    className="mb-2"),
-            html.P([html.Strong("RT3: "), "XML voyage report format with embedded route data."],
-                   className="mb-2"),
-            html.P([html.Strong("RTM: "), "Binary route file format compatible with legacy systems."],
+            html.P([html.Strong("CSV (Output): "), "Comma-separated values for spreadsheets and data analysis."],
                    className="mb-2"),
             html.Hr(),
             html.P([html.Strong("Tips: "), "Files are processed in memory for the current request "
-                                            "and are not stored."],
+                                           "and are not stored."],
                    className="text-muted mb-0 small"),
         ]
     ),
@@ -717,7 +813,7 @@ app.layout = dbc.Container(
         html.Hr(className="my-4"),
         html.Footer(
             html.Small(
-                f"© {datetime.now(timezone.utc).year} Convert_RTZ · Built with Dash · Hosted on Render",
+                f"© {datetime.now(timezone.utc).year} RT3/RTM → CSV Converter · Built with Dash · Hosted on Render",
                 className="text-muted",
             ),
             className="text-center pb-4",
@@ -740,9 +836,6 @@ app.layout = dbc.Container(
     Output("preview-card", "style"),
     Output("download-card", "style"),
     Output("download-csv-btn", "disabled"),
-    Output("download-txt-btn", "disabled"),
-    Output("download-rt3-btn", "disabled"),
-    Output("download-rtm-btn", "disabled"),
     Output("preview-title", "children"),
     Output("row-count-badge", "children"),
     Output("preview-table", "children"),
@@ -752,15 +845,21 @@ app.layout = dbc.Container(
 def on_upload(contents, filename):
     if not contents:
         return (None, "", {"display": "none"}, {"display": "none"},
-                True, True, True, True, "Data Preview", "", "")
+                True, "Data Preview", "", "")
 
     try:
-        text = decode_upload(contents)
-        parsed = convert_to_dataframe(filename, text)
+        raw = decode_upload(contents, as_bytes=True)
+        # For text-based formats (RT3), decode to string; for binary RTM keep as bytes
+        name = (filename or "").lower()
+        if name.endswith(".rtm"):
+            parsed = convert_to_dataframe(filename, raw)
+        else:
+            text = raw.decode("utf-8", errors="replace")
+            parsed = convert_to_dataframe(filename, text)
     except Exception as exc:
         msg = dbc.Alert(f"Failed to parse file: {exc}", color="danger", className="mt-3")
         return (None, msg, {"display": "none"}, {"display": "none"},
-                True, True, True, True, "Data Preview", "", "")
+                True, "Data Preview", "", "")
 
     if parsed is None or parsed.empty:
         msg = dbc.Alert(
@@ -769,7 +868,7 @@ def on_upload(contents, filename):
             className="mt-3",
         )
         return (None, msg, {"display": "none"}, {"display": "none"},
-                True, True, True, True, "Data Preview", "", "")
+                True, "Data Preview", "", "")
 
     df = _drop_empty_columns(parsed)
     store = {"filename": filename, "records": df.to_dict(orient="records")}
@@ -826,7 +925,7 @@ def on_upload(contents, filename):
         status,
         {"display": "block", "border": "none", "borderRadius": "8px"},
         {"display": "block", "border": "none", "borderRadius": "8px"},
-        False, False, False, False,
+        False,
         f"Preview — {filename or 'file'}",
         f"{len(df)} rows",
         table,
@@ -837,7 +936,7 @@ def _get_base_filename(store):
     """Extract the base filename (without extension) from the store."""
     if not store:
         return "converted_route"
-    filename = store.get("filename", "route.rtz") or "route.rtz"
+    filename = store.get("filename", "route.rt3") or "route.rt3"
     base = filename.rsplit(".", 1)[0] if "." in filename else filename
     return base
 
@@ -857,49 +956,6 @@ def on_download_csv(n_clicks, store):
     return dict(content=content, filename=f"{base}.csv")
 
 
-@app.callback(
-    Output("download-txt", "data"),
-    Input("download-txt-btn", "n_clicks"),
-    State("df-store", "data"),
-    prevent_initial_call=True,
-)
-def on_download_txt(n_clicks, store):
-    if not store or not store.get("records"):
-        return dash.no_update
-    df = _drop_empty_columns(pd.DataFrame(store["records"]))
-    base = _get_base_filename(store)
-    content = generate_txt(df)
-    return dict(content=content, filename=f"{base}.txt")
-
-
-@app.callback(
-    Output("download-rt3", "data"),
-    Input("download-rt3-btn", "n_clicks"),
-    State("df-store", "data"),
-    prevent_initial_call=True,
-)
-def on_download_rt3(n_clicks, store):
-    if not store or not store.get("records"):
-        return dash.no_update
-    df = _drop_empty_columns(pd.DataFrame(store["records"]))
-    base = _get_base_filename(store)
-    content = generate_rt3(df)
-    return dict(content=content, filename=f"{base}.rt3")
-
-
-@app.callback(
-    Output("download-rtm", "data"),
-    Input("download-rtm-btn", "n_clicks"),
-    State("df-store", "data"),
-    prevent_initial_call=True,
-)
-def on_download_rtm(n_clicks, store):
-    if not store or not store.get("records"):
-        return dash.no_update
-    df = _drop_empty_columns(pd.DataFrame(store["records"]))
-    base = _get_base_filename(store)
-    content = generate_rtm(df)
-    return dcc.send_bytes(content, f"{base}.rtm")
 
 
 # ---------------------------------------------------------------------------

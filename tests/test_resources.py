@@ -127,15 +127,12 @@ class ResourceConversionTests(unittest.TestCase):
         path = RESOURCE_DIR / "TO AMSTERDAM.rtz"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
 
-        store, _status, _preview_style, _download_style, csv_disabled, txt_disabled, rt3_disabled, rtm_disabled, _title, badge, _table = app.on_upload(
+        store, _status, _preview_style, _download_style, csv_disabled, _title, badge, _table = app.on_upload(
             f"data:application/octet-stream;base64,{encoded}",
             path.name,
         )
 
         self.assertFalse(csv_disabled)
-        self.assertFalse(txt_disabled)
-        self.assertFalse(rt3_disabled)
-        self.assertFalse(rtm_disabled)
         self.assertEqual(badge, "45 rows")
         self.assertEqual(len(store["records"]), 45)
         self.assertEqual(store["filename"], path.name)
