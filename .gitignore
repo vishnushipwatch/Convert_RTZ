@@ -52,3 +52,5 @@ htmlcov/
 *.rtz
 *.rtm
 *.txt
+*.rt3
+*.csv

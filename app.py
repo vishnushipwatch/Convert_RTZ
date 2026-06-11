@@ -150,6 +150,69 @@ def _parse_waypoints_from_route(route, route_index=1, route_name=""):
     return rows
 
 
+def _parse_tsh_route_waypoint(el):
+    """
+    Parse a single <WayPoint> element from a TSH_Route file.
+
+    Coordinates in TSH files are stored as arc-minutes (e.g. 1499.705 = 24.995°N).
+    Port/starboard XTEs use 'PortXTE'/'StbXTE'.
+    """
+    lat_min = _to_float(el.attrib.get("Lat"))
+    lon_min = _to_float(el.attrib.get("Lon"))
+    lat = lat_min / 60.0 if lat_min is not None else None
+    lon = lon_min / 60.0 if lon_min is not None else None
+
+    return {
+        "WaypointId": el.attrib.get("Id", ""),
+        "Name": el.attrib.get("WPName", ""),
+        "Latitude": lat,
+        "Longitude": lon,
+        "Radius": _to_float(el.attrib.get("ArrivalC")),
+        "SpeedMax": None,
+        "SpeedMin": None,
+        "Course": _to_float(el.attrib.get("TurnRate")),
+        "LegDistance": None,
+        "TurnRadius": _to_float(el.attrib.get("TurnRadius")),
+        "LegGeometryType": "",
+        "StarboardXTD": _to_float(el.attrib.get("StbXTE")),
+        "PortsideXTD": _to_float(el.attrib.get("PortXTE")),
+    }
+
+
+def parse_tsh_route(content):
+    """
+    Parse a TSH_Route (proprietary XML route format) file.
+
+    Structure: <TSH_Route RtName="..."> <WayPoints> <WayPoint Lat="..." Lon="..." />
+    Coordinates are in arc-minutes (minutes / 60 = decimal degrees).
+    """
+    root = ET.fromstring(content)
+
+    if _local(root.tag) != "TSH_Route":
+        # Not a TSH_Route file – delegate to the standard RT3 parser
+        return parse_rt3(content)
+
+    route_name = root.attrib.get("RtName", "")
+
+    rows = []
+    for waypoints_el in root.iter():
+        if _local(waypoints_el.tag) != "WayPoints":
+            continue
+        for child in waypoints_el:
+            if _local(child.tag) != "WayPoint":
+                continue
+            row = _parse_tsh_route_waypoint(child)
+            row["RouteIndex"] = 1
+            row["RouteName"] = route_name
+            row["Revision"] = ""
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return _drop_empty_columns(pd.DataFrame(rows))
+
+
 def parse_rtz(content):
     """Parse an RTZ (XML) route file and return a DataFrame of waypoints."""
     root = ET.fromstring(content)
@@ -592,7 +655,8 @@ def convert_to_dataframe(filename, content):
     if name.endswith(".rtz"):
         return parse_rtz(content)
     if name.endswith(".rt3"):
-        return parse_rt3(content)
+        # TSH_Route is a proprietary variant of RT3; parse_tsh_route auto-detects it
+        return parse_tsh_route(content)
     if name.endswith(".rtm"):
         return parse_rtm(content)
     # Unknown extension: best effort XML parse
