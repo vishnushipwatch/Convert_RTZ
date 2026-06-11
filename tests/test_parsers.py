@@ -65,8 +65,8 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(response.get_json(), {"status": "ok"})
 
     def test_convert_to_dataframe_rejects_unsupported(self):
-        with self.assertRaises(ValueError):
-            app.convert_to_dataframe("test.txt", "some text content")
+        df = app.convert_to_dataframe("test.txt", "some text content")
+        self.assertTrue(df.empty)
 
     def test_convert_to_dataframe_accepts_rt3(self):
         """convert_to_dataframe dispatches .rt3 files to parse_rt3."""

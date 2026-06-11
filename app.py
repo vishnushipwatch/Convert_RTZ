@@ -44,6 +44,8 @@ def _child_text(el, name):
 
 
 def _attr_or_child(el, attr_name, child_name=None):
+    if el is None:
+        return ""
     if attr_name in el.attrib:
         return el.attrib.get(attr_name, "")
     return _child_text(el, child_name or attr_name)
@@ -165,6 +167,9 @@ def parse_tsh_route(content):
     Coordinates are in arc-minutes (minutes / 60 = decimal degrees).
     """
     root = ET.fromstring(content)
+
+    if _local(root.tag) != "TSH_Route":
+        return parse_rt3(content)
 
     route_name = root.attrib.get("RtName", "")
 
