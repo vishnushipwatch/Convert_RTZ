@@ -619,13 +619,11 @@ def generate_rtm(df):
 def convert_to_dataframe(filename, content):
     """Detect the file type by extension and return a normalised DataFrame."""
     name = (filename or "").lower()
-    if name.endswith(".rtz"):
-        return parse_rtz(content)
     if name.endswith(".rt3"):
         return parse_tsh_route(content)
     if name.endswith(".rtm"):
         return parse_rtm(content)
-    # Unknown extension: best effort XML parse
+    # Unknown extension: best effort XML parse (internal delegate)
     if isinstance(content, str) and content.lstrip().startswith("<"):
         return parse_rtz(content)
     return pd.DataFrame()

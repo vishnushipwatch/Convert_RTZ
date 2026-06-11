@@ -13,11 +13,6 @@ This document describes in detail how this application converts maritime route f
 | **TSH_Route**| `.rt3`    | Proprietary XML variant of RT3, detected by the `<TSH_Route>` root element. Coordinates are stored as *arc-minutes*. |
 | **RTM**      | `.rtm`    | Binary route file format with fixed-size records and little-endian doubles for coordinates. |
 
-> **Note on RTZ:** The application can internally parse bare RTZ (Route Exchange Format) XML
-> as a delegate of the RT3 parser — because RT3 wraps an RTZ-style `<route>` within a
-> `<report>` container. However, RTZ is **not** an accepted upload format; only `.rt3`
-> and `.rtm` files are accepted by the upload dialog.
-
 The entry-point function `convert_to_dataframe()` in `app.py` inspects the file extension
 to dispatch parsing:
 
@@ -26,8 +21,10 @@ to dispatch parsing:
 .rtm  → parse_rtm()
 ```
 
-If the extension is unknown but the content starts with `<`, a best-effort XML parse
-is attempted via `parse_rtz()` as a fallback.
+> **Internal detail:** If an uploaded file has an unrecognised extension but its content
+> starts with `<`, the parser makes a best-effort XML parse via `parse_rtz()` as a
+> fallback. RTZ (Route Exchange Format) is not a user-facing upload format but is used
+> internally as a delegate by the RT3 parser.
 
 ---
 
@@ -248,7 +245,6 @@ decode_upload()          — Decodes base64 data URI → raw bytes or text
        ▼
 convert_to_dataframe()   — Dispatches to the correct parser based on extension
        │
-       ├── .rtz  → parse_rtz()
        ├── .rt3  → parse_tsh_route()  (→ parse_rt3() → parse_rtz() for standard RT3)
        └── .rtm  → parse_rtm()
        │
