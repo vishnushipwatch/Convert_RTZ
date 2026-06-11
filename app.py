@@ -6,7 +6,6 @@ A Dash application that converts maritime RT3 and RTM route files to CSV format.
 import base64
 import csv
 import io
-import re
 import struct
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -26,76 +25,55 @@ def _local(tag):
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
-def _text(el, default=""):
+def _text(el):
     if el is None or el.text is None:
-        return default
+        return ""
     return el.text.strip()
 
 
 def _find_child(el, name):
     """Find a direct child by local tag name, ignoring XML namespaces."""
-    if el is None:
-        return None
     for child in el:
         if _local(child.tag) == name:
             return child
     return None
 
 
-def _child_text(el, name, default=""):
-    return _text(_find_child(el, name), default)
+def _child_text(el, name):
+    return _text(_find_child(el, name))
 
 
-def _attr_or_child(el, attr_name, child_name=None, default=""):
-    if el is not None and attr_name in el.attrib:
-        return el.attrib.get(attr_name, default)
-    return _child_text(el, child_name or attr_name, default)
+def _attr_or_child(el, attr_name, child_name=None):
+    if attr_name in el.attrib:
+        return el.attrib.get(attr_name, "")
+    return _child_text(el, child_name or attr_name)
 
 
-def _to_float(value, default=None):
-    try:
-        if value in (None, ""):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _to_float(value):
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
-def _coordinate_to_decimal(value, default=None):
+def _coordinate_to_decimal(value):
     """
     Convert decimal or degrees/minutes/cardinal route coordinates to decimal degrees.
     Examples: -95.13035, "23 08.368 S", "044 02.408 W".
     """
-    if value in (None, ""):
-        return default
-    if isinstance(value, (int, float)):
+    if value is None:
+        return None
+    try:
         return float(value)
-
-    text = str(value).strip()
-    decimal = _to_float(text)
-    if decimal is not None:
-        return decimal
-
-    match = re.match(r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*([NSEW])$", text, re.IGNORECASE)
-    if not match:
-        return default
-
-    degrees, minutes, hemisphere = match.groups()
-    result = float(degrees) + float(minutes) / 60
-    if hemisphere.upper() in ("S", "W"):
-        result *= -1
-    return result
+    except (TypeError, ValueError):
+        return None
 
 
 def _clean_binary_text(raw):
     return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
 
 
-def _first_printable_text(raw, default=""):
-    match = re.search(rb"[ -~]{3,}", raw)
-    if not match:
-        return default
-    return match.group(0).decode("utf-8", errors="replace").strip()
+def _first_printable_text(raw):
+    return raw.decode("utf-8", errors="replace").strip()
 
 
 def _drop_empty_columns(df):
@@ -187,10 +165,6 @@ def parse_tsh_route(content):
     Coordinates are in arc-minutes (minutes / 60 = decimal degrees).
     """
     root = ET.fromstring(content)
-
-    if _local(root.tag) != "TSH_Route":
-        # Not a TSH_Route file – delegate to the standard RT3 parser
-        return parse_rt3(content)
 
     route_name = root.attrib.get("RtName", "")
 
@@ -298,19 +272,11 @@ def parse_rtm(content):
     else:
         raw = content
 
-    if len(raw) < RTM_RECORDS_START:
-        raise ValueError("File too small to be a valid RTM route file")
-
     # Read header
     header = raw[:RTM_HEADER_SIZE]
     header_text = _clean_binary_text(header)
-    if not header_text.startswith("Route File Version"):
-        # Try to be lenient - maybe the header is just shorter
-        pass
 
     # Read waypoint count
-    if len(raw) < RTM_WAYPOINT_COUNT_OFFSET + 4:
-        raise ValueError("Could not read waypoint count from RTM file")
     waypoint_count = struct.unpack_from("<I", raw, RTM_WAYPOINT_COUNT_OFFSET)[0]
 
     # Read route name
@@ -323,7 +289,6 @@ def parse_rtm(content):
         record_offset = RTM_RECORDS_START + i * RTM_RECORD_SIZE
 
         if record_offset + RTM_RECORD_SIZE > len(raw):
-            # Partial record at end — stop parsing
             break
 
         record = raw[record_offset:record_offset + RTM_RECORD_SIZE]
@@ -355,9 +320,6 @@ def parse_rtm(content):
             "PortsideXTD": None,
         }
         rows.append(row)
-
-    if not rows:
-        raise ValueError("No waypoints found in RTM file")
 
     return _drop_empty_columns(pd.DataFrame(rows))
 
@@ -655,14 +617,13 @@ def convert_to_dataframe(filename, content):
     if name.endswith(".rtz"):
         return parse_rtz(content)
     if name.endswith(".rt3"):
-        # TSH_Route is a proprietary variant of RT3; parse_tsh_route auto-detects it
         return parse_tsh_route(content)
     if name.endswith(".rtm"):
         return parse_rtm(content)
     # Unknown extension: best effort XML parse
     if isinstance(content, str) and content.lstrip().startswith("<"):
         return parse_rtz(content)
-    raise ValueError(f"Unsupported file format: {filename}. Supported formats: .rt3, .rtm.")
+    return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -674,14 +635,11 @@ def decode_upload(contents, as_bytes=False):
     if not contents:
         return b"" if as_bytes else ""
     if contents.startswith("data:"):
-        try:
-            _, _, b64 = contents.partition(",")
-            raw = base64.b64decode(b64)
-            if as_bytes:
-                return raw
-            return raw.decode("utf-8", errors="replace")
-        except Exception:
-            return b"" if as_bytes else ""
+        _, _, b64 = contents.partition(",")
+        raw = base64.b64decode(b64)
+        if as_bytes:
+            return raw
+        return raw.decode("utf-8", errors="replace")
     return contents
 
 
@@ -911,19 +869,14 @@ def on_upload(contents, filename):
         return (None, "", {"display": "none"}, {"display": "none"},
                 True, "Data Preview", "", "")
 
-    try:
-        raw = decode_upload(contents, as_bytes=True)
-        # For text-based formats (RT3), decode to string; for binary RTM keep as bytes
-        name = (filename or "").lower()
-        if name.endswith(".rtm"):
-            parsed = convert_to_dataframe(filename, raw)
-        else:
-            text = raw.decode("utf-8", errors="replace")
-            parsed = convert_to_dataframe(filename, text)
-    except Exception as exc:
-        msg = dbc.Alert(f"Failed to parse file: {exc}", color="danger", className="mt-3")
-        return (None, msg, {"display": "none"}, {"display": "none"},
-                True, "Data Preview", "", "")
+    raw = decode_upload(contents, as_bytes=True)
+    # For text-based formats (RT3), decode to string; for binary RTM keep as bytes
+    name = (filename or "").lower()
+    if name.endswith(".rtm"):
+        parsed = convert_to_dataframe(filename, raw)
+    else:
+        text = raw.decode("utf-8", errors="replace")
+        parsed = convert_to_dataframe(filename, text)
 
     if parsed is None or parsed.empty:
         msg = dbc.Alert(
