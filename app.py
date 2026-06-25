@@ -122,7 +122,7 @@ def _parse_waypoints_from_route(route, route_index=1, route_name=""):
             "Course": _to_float(_attr_or_child(wp, "course")),
             "LegDistance": _to_float(_attr_or_child(wp, "legDistance")),
             "TurnRadius": _to_float(_attr_or_child(wp, "turnRadius")),
-            "LegGeometryType": _attr_or_child(leg, "geometryType"),
+            "Type": _attr_or_child(leg, "geometryType"),
             "StarboardXTD": _to_float(_attr_or_child(leg, "starboardXTD")),
             "PortsideXTD": _to_float(_attr_or_child(leg, "portsideXTD")),
         }
@@ -153,7 +153,7 @@ def _parse_tsh_route_waypoint(el):
         "Course": _to_float(el.attrib.get("TurnRate")),
         "LegDistance": None,
         "TurnRadius": _to_float(el.attrib.get("TurnRadius")),
-        "LegGeometryType": "",
+        "Type": "",
         "StarboardXTD": _to_float(el.attrib.get("StbXTE")),
         "PortsideXTD": _to_float(el.attrib.get("PortXTE")),
     }
@@ -320,7 +320,7 @@ def parse_rtm(content):
             "Course": None,
             "LegDistance": None,
             "TurnRadius": None,
-            "LegGeometryType": "",
+            "Type": "",
             "StarboardXTD": None,
             "PortsideXTD": None,
         }
@@ -353,6 +353,85 @@ def _decimal_to_dms_components(decimal, is_lat):
     degrees = int(abs_val)
     minutes = (abs_val - degrees) * 60
     return (f"{degrees:02d}", f"{minutes:06.3f}", hemisphere)
+
+
+def _format_df_for_preview(df):
+    """Format the DataFrame to match the CSV export layout for preview."""
+    if df.empty:
+        return df
+    
+    preview_rows = []
+    for idx, (_, row) in enumerate(df.iterrows()):
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
+        
+        if pd.notna(lat) and lat is not None:
+            lat_deg, lat_min, lat_hemi = _decimal_to_dms_components(lat, is_lat=True)
+        else:
+            lat_deg, lat_min, lat_hemi = "", "", ""
+        
+        if pd.notna(lon) and lon is not None:
+            lon_deg, lon_min, lon_hemi = _decimal_to_dms_components(lon, is_lat=False)
+        else:
+            lon_deg, lon_min, lon_hemi = "", "", ""
+        
+        port_xtd = row.get("PortsideXTD")
+        stbd_xtd = row.get("StarboardXTD")
+        radius = row.get("Radius")
+        speed = row.get("SpeedMax")
+        leg_geom = row.get("Type")
+        turn_radius = row.get("TurnRadius")
+        wp_name = row.get("Name") or row.get("WaypointId") or ""
+        
+        # Map geometry type values: Orthodrome -> GC, Loxodrome -> RL
+        if isinstance(leg_geom, str):
+            leg_geom = leg_geom.strip()
+            if leg_geom.lower() == "orthodrome":
+                leg_geom = "GC"
+            elif leg_geom.lower() == "loxodrome":
+                leg_geom = "RL"
+        
+        # Helper: format value or "***" for missing
+        def _val(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return "***"
+            if isinstance(v, float):
+                return f"{v:.2f}".rstrip("0").rstrip(".") if "." in f"{v:.2f}" else f"{v:.2f}"
+            s = str(v).strip()
+            return s if s else "***"
+        
+        # Compute ROT if both speed and turn radius are available
+        speed_f = _to_float(speed)
+        turn_rad_f = _to_float(turn_radius)
+        if speed_f is not None and turn_rad_f is not None and turn_rad_f > 0 and _to_float(speed) and pd.notna(speed):
+            rot = speed_f / turn_rad_f * 180 / (3.141592653589793 * 60)
+            rot_str = f"{rot:.2f}"
+        else:
+            rot_str = "***"
+        
+        # For the first (start) waypoint, use *** for navigation fields
+        is_first = (idx == 0)
+        
+        preview_rows.append({
+            "WPT No.": f"{idx:03d}",
+            "LAT (deg)": lat_deg,
+            "LAT (min)": lat_min,
+            "LAT (hemi)": lat_hemi,
+            "LON (deg)": lon_deg,
+            "LON (min)": lon_min,
+            "LON (hemi)": lon_hemi,
+            "PORT[NM]": "***" if is_first else _val(port_xtd),
+            "STBD[NM]": "***" if is_first else _val(stbd_xtd),
+            "Arr. Rad[NM]": "***" if is_first else _val(radius),
+            "Speed[kn]": "***" if is_first else _val(speed),
+            "Sail(RL/GC)": "***" if is_first else _val(leg_geom),
+            "ROT[deg/min]": "***" if is_first else rot_str,
+            "Turn Rad[NM]": "***" if is_first else _val(turn_radius),
+            "Time Zone": "00:00",
+            "Name": str(wp_name) if wp_name else "",
+        })
+    
+    return pd.DataFrame(preview_rows)
 
 
 def generate_csv(df):
@@ -398,9 +477,17 @@ def generate_csv(df):
         stbd_xtd = row.get("StarboardXTD")
         radius = row.get("Radius")
         speed = row.get("SpeedMax")
-        leg_geom = row.get("LegGeometryType")
+        leg_geom = row.get("Type")
         turn_radius = row.get("TurnRadius")
         wp_name = row.get("Name") or row.get("WaypointId") or ""
+
+        # Map geometry type values: Orthodrome -> GC, Loxodrome -> RL
+        if isinstance(leg_geom, str):
+            leg_geom = leg_geom.strip()
+            if leg_geom.lower() == "orthodrome":
+                leg_geom = "GC"
+            elif leg_geom.lower() == "loxodrome":
+                leg_geom = "RL"
 
         # Helper: format value or "***" for missing
         def _val(v):
@@ -451,7 +538,7 @@ def generate_txt(df):
 
     lines = []
     # Header
-    header_cols = ["NAME", "LAT", "LON", "LEG_TYPE", "TURN_RADIUS",
+    header_cols = ["NAME", "LAT", "LON", "TYPE", "TURN_RADIUS",
                    "CHN_LIMIT", "PLANNED_SPEED", "SPEED_MIN", "SPEED_MAX",
                    "COURSE", "LENGTH", "DO_PLAN", "HFO_PLAN", "HFO_LEFT",
                    "DO_LEFT", "ETA_DAY", "ETA_TIME"]
@@ -467,7 +554,7 @@ def generate_txt(df):
             str(row.get("Name", "") or ""),
             lat_str,
             lon_str,
-            str(row.get("LegGeometryType", "") or ""),
+            str(row.get("Type", "") or ""),
             str(row.get("TurnRadius", "") or ""),
             "",
             str(row.get("SpeedMax", "") or ""),
@@ -540,7 +627,7 @@ def generate_rt3(df):
             wp.set("legDistance", str(leg_distance))
 
         leg = ET.SubElement(wp, "leg")
-        leg_geom = row.get("LegGeometryType")
+        leg_geom = row.get("Type")
         if pd.notna(leg_geom) and str(leg_geom).strip():
             leg.set("geometryType", str(leg_geom))
 
@@ -623,6 +710,8 @@ def convert_to_dataframe(filename, content):
         return parse_tsh_route(content)
     if name.endswith(".rtm"):
         return parse_rtm(content)
+    if name.endswith(".rtz"):
+        return parse_rtz(content)
     # Unknown extension: best effort XML parse (internal delegate)
     if isinstance(content, str) and content.lstrip().startswith("<"):
         return parse_rtz(content)
@@ -659,7 +748,7 @@ external_stylesheets = [
 app = dash.Dash(
     __name__,
     external_stylesheets=external_stylesheets,
-    title="RT3 / RTM → CSV Converter",
+    title="RT3 / RTM / RTZ → CSV Converter",
     suppress_callback_exceptions=True,
     update_title=None,
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
@@ -685,7 +774,7 @@ NAVBAR = dbc.Navbar(
                         dbc.Col(html.I(className="bi bi-compass",
                                        style={"fontSize": "1.8rem", "color": "#ffffff"})),
                         dbc.Col(
-                            dbc.NavbarBrand("RT3 / RTM → CSV Converter",
+                            dbc.NavbarBrand("RT3 / RTM / RTZ → CSV Converter",
                                             className="ms-2",
                                             style={"fontWeight": "600", "color": "white"}),
                         ),
@@ -715,7 +804,7 @@ UPLOAD_CARD = dbc.Card(
                            style={"fontSize": "2.5rem", "color": "#2C3E50"}),
                     html.H4("Drop your file here", className="mt-3 mb-1",
                             style={"fontWeight": "600"}),
-            html.P("or click to browse — supports .rt3, .rtm files",
+            html.P("or click to browse — supports .rt3, .rtm, .rtz files",
                            className="text-muted mb-3"),
                 ],
                 className="text-center",
@@ -743,7 +832,7 @@ UPLOAD_CARD = dbc.Card(
                     "cursor": "pointer",
                 },
                 multiple=False,
-                accept=".rt3,.rtm",
+                accept=".rt3,.rtm,.rtz",
             ),
             html.Div(id="upload-status", className="mt-3"),
         ]
@@ -803,7 +892,7 @@ ABOUT_CARD = dbc.Card(
             html.H5([html.I(className="bi bi-info-circle me-2"), "About"],
                     style={"fontWeight": "600"}),
             html.P(
-                "This tool converts maritime route files (RT3, RTM) into "
+                "This tool converts maritime route files (RT3, RTM, RTZ) into "
                 "CSV format for use in spreadsheets and data analysis.",
                 className="text-muted",
             ),
@@ -811,6 +900,8 @@ ABOUT_CARD = dbc.Card(
             html.P([html.Strong("RT3 (Input): "), "XML voyage report format with embedded route data."],
                    className="mb-2"),
             html.P([html.Strong("RTM (Input): "), "Binary route file format compatible with legacy systems."],
+                   className="mb-2"),
+            html.P([html.Strong("RTZ (Input): "), "XML route file format (RTZ standard)."],
                    className="mb-2"),
             html.P([html.Strong("CSV (Output): "), "Comma-separated values for spreadsheets and data analysis."],
                    className="mb-2"),
@@ -838,7 +929,7 @@ app.layout = dbc.Container(
         html.Hr(className="my-4"),
         html.Footer(
             html.Small(
-                f"© {datetime.now(timezone.utc).year} RT3/RTM → CSV Converter · Built with Dash · Hosted on Render",
+                f"© {datetime.now(timezone.utc).year} RT3/RTM/RTZ → CSV Converter · Built with Dash · Hosted on Render",
                 className="text-muted",
             ),
             className="text-center pb-4",
@@ -904,7 +995,9 @@ def on_upload(contents, filename):
         className="mt-3 d-flex align-items-center",
     )
 
-    preview_df = df.head(50)
+    # Format the data to match CSV export for preview
+    formatted_df = _format_df_for_preview(df)
+    preview_df = formatted_df.head(50)
     table = dash_table.DataTable(
         data=preview_df.to_dict(orient="records"),
         columns=[{"name": c, "id": c} for c in preview_df.columns],
